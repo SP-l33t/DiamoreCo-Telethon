@@ -18,11 +18,13 @@ class Settings(BaseSettings):
     AUTO_UPGRADE_REDUCE_COOLDOWN: bool = True
     AUTO_UPGRADE_REDUCE_COOLDOWN_LEVEL: int = 20
 
-    REF_ID: str = ''
+    REF_ID: str = '525256526'
 
     USE_PROXY_FROM_FILE: bool = False
 
+    DEVICE_PARAMS: bool = False
+
+    DEBUG_LOGGING: bool = False
+
 
 settings = Settings()
-
-

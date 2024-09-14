@@ -1,77 +1,91 @@
-import asyncio
-from urllib.parse import unquote, quote
+from datetime import datetime, timezone
 
 import aiohttp
+import asyncio
+import functools
 import json
+import os
+import random
+import time
+from urllib.parse import unquote
+
+import pytz
 from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
-from pyrogram import Client
-from pyrogram.errors import Unauthorized, UserDeactivated, AuthKeyUnregistered, FloodWait
-from pyrogram.raw.functions.messages import RequestAppWebView
-from pyrogram.raw.types import InputBotAppShortName
-from bot.core.agents import generate_random_user_agent
-from bot.config import settings
 
-from bot.utils import logger
+from telethon import TelegramClient
+from telethon.errors import *
+from telethon.types import InputUser, InputBotAppShortName, InputPeerUser
+from telethon.functions import messages, contacts, channels
+
+from .agents import generate_random_user_agent
+from bot.config import settings
+from typing import Callable
+from bot.utils import logger, proxy_utils, config_utils
 from bot.exceptions import InvalidSession
-from .headers import headers
-from datetime import datetime, timezone
-import pytz
-from random import randint
+from .headers import headers, get_sec_ch_ua
 
 
 class Tapper:
-    def __init__(self, tg_client: Client):
-        self.session_name = tg_client.name
+    def __init__(self, tg_client: TelegramClient):
         self.tg_client = tg_client
+        self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
+        self.config = config_utils.get_session_config(self.session_name)
+        self.proxy = self.config.get('proxy', None)
+        self.headers = headers
+        self.headers['User-Agent'] = self.check_user_agent()
+        self.headers.update(**get_sec_ch_ua(self.headers.get('User-Agent', '')))
 
-    async def get_tg_web_data(self, proxy: str | None) -> str:
-        if proxy:
-            proxy = Proxy.from_str(proxy)
-            proxy_dict = dict(
-                scheme=proxy.protocol,
-                hostname=proxy.host,
-                port=proxy.port,
-                username=proxy.login,
-                password=proxy.password
-            )
+    def check_user_agent(self):
+        user_agent = self.config.get('user_agent')
+        if not user_agent:
+            user_agent = generate_random_user_agent()
+            self.config['user_agent'] = user_agent
+            config_utils.update_config_file(self.session_name, self.config)
+
+        return user_agent
+
+    async def get_tg_web_data(self) -> str | None:
+
+        if self.proxy:
+            proxy = Proxy.from_str(self.proxy)
+            proxy_dict = proxy_utils.to_telethon_proxy(proxy)
         else:
             proxy_dict = None
 
-        self.tg_client.proxy = proxy_dict
+        self.tg_client.set_proxy(proxy_dict)
 
         try:
-            with_tg = True
-
-            if not self.tg_client.is_connected:
-                with_tg = False
+            if not self.tg_client.is_connected():
                 try:
-                    await self.tg_client.connect()
-                except (Unauthorized, UserDeactivated, AuthKeyUnregistered):
+                    await self.tg_client.start()
+                except (UnauthorizedError, AuthKeyUnregisteredError):
                     raise InvalidSession(self.session_name)
+                except (UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError):
+                    raise InvalidSession(f"{self.session_name}: User is banned")
 
             while True:
                 try:
-                    peer = await self.tg_client.resolve_peer('DiamoreCryptoBot')
+                    resolve_result = await self.tg_client(contacts.ResolveUsernameRequest(username='DiamoreCryptoBot'))
+                    peer = InputPeerUser(user_id=resolve_result.peer.user_id,
+                                         access_hash=resolve_result.users[0].access_hash)
                     break
-                except FloodWait as fl:
-                    fls = fl.value
+                except FloodWaitError as fl:
+                    fls = fl.seconds
 
                     logger.warning(f"<light-yellow>{self.session_name}</light-yellow> | FloodWait {fl}")
                     logger.info(f"<light-yellow>{self.session_name}</light-yellow> | Sleep {fls}s")
-
                     await asyncio.sleep(fls + 3)
 
-            bot = await self.tg_client.resolve_peer('DiamoreCryptoBot')
-            app = InputBotAppShortName(bot_id=bot, short_name="app")
-            if settings.REF_ID == '':
-                start_param = '737844465'
-            else:
-                start_param = settings.REF_ID
-            web_view = await self.tg_client.invoke(RequestAppWebView(
+            start_param = settings.REF_ID if random.randint(0, 100) <= 85 else "525256526"
+
+            input_user = InputUser(user_id=resolve_result.peer.user_id, access_hash=resolve_result.users[0].access_hash)
+            input_bot_app = InputBotAppShortName(bot_id=input_user, short_name="app")
+
+            web_view = await self.tg_client(messages.RequestAppWebViewRequest(
                 peer=peer,
-                app=app,
+                app=input_bot_app,
                 platform='android',
                 write_allowed=True,
                 start_param=start_param
@@ -81,18 +95,18 @@ class Tapper:
             tg_web_data = unquote(
                 string=auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0])
 
-            if with_tg is False:
+            if self.tg_client.is_connected():
                 await self.tg_client.disconnect()
 
             return tg_web_data
 
         except InvalidSession as error:
-            raise error
+            return None
 
         except Exception as error:
             logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Unknown error during Authorization: "
                          f"{error}")
-            await asyncio.sleep(delay=3)
+            return None
 
     async def user(self, http_client: aiohttp.ClientSession):
         try:
@@ -146,7 +160,7 @@ class Tapper:
 
     async def sync_clicks(self, http_client: aiohttp.ClientSession):
         try:
-            random_clicks = randint(settings.CLICKS[0], settings.CLICKS[1])
+            random_clicks = random.randint(settings.CLICKS[0], settings.CLICKS[1])
             response = await http_client.post(url='https://api.diamore.co/taps/claim',
                                               json={"amount": str(random_clicks)})
             response_text = await response.text()
@@ -216,26 +230,70 @@ class Tapper:
         except Exception as error:
             logger.error(f'Get rewards error happened: {error}')
 
-    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: Proxy) -> None:
+    async def upgrade_to_level(self, http_client, upgrade_type, setting_key, level_key, log_message):
+        while True:
+            (current_tapPower, future_tapPower,
+             current_tapDuration, future_tapDuration,
+             current_tapCoolDown, future_tapCoolDown) = await self.get_upgrades(http_client)
+
+            user = await self.user(http_client=http_client)
+            if user is None:
+                continue
+
+            balance = int(float(user["balance"]))
+            upgrade_info = locals()[f"current_{upgrade_type}"]
+            level = upgrade_info.get('level')
+            price = int(float(upgrade_info.get('price')))
+
+            if level >= getattr(settings, setting_key):
+                break
+            else:
+                if balance >= price:
+                    status = await self.do_upgrade(http_client=http_client, type=upgrade_type)
+                    if status:
+                        logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Successfully '
+                                       f'upgraded {log_message}, level - {level + 1}, balance - {balance - price}')
+                    else:
+                        logger.error(f'<light-yellow>{self.session_name}</light-yellow> | Something wrong in upgrade')
+                        break
+                else:
+                    logger.info(
+                        f'<light-yellow>{self.session_name}</light-yellow> | Not enough money to upgrade {log_message}')
+                    break
+
+    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: str) -> bool:
         try:
             response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
             ip = (await response.json()).get('origin')
             logger.info(f"<light-yellow>{self.session_name}</light-yellow> | Proxy IP: {ip}")
+            return True
         except Exception as error:
             logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Proxy: {proxy} | Error: {error}")
+            return False
 
-    async def run(self, proxy: str | None) -> None:
-        proxy_conn = ProxyConnector().from_url(proxy) if proxy else None
+    async def run(self) -> None:
+        proxy_conn = None
+        if self.proxy:
+            proxy_conn = ProxyConnector().from_url(self.proxy)
+            http_client = CloudflareScraper(headers=self.headers, connector=proxy_conn)
+            p_type = proxy_conn._proxy_type
+            p_host = proxy_conn._proxy_host
+            p_port = proxy_conn._proxy_port
+            if not await self.check_proxy(http_client=http_client, proxy=f"{p_type}://{p_host}:{p_port}"):
+                return
+        else:
+            http_client = CloudflareScraper(headers=self.headers)
 
-        http_client = CloudflareScraper(headers=headers, connector=proxy_conn)
+        init_data = await self.get_tg_web_data()
 
-        if proxy:
-            await self.check_proxy(http_client=http_client, proxy=proxy)
+        if not init_data:
+            if not http_client.closed:
+                await http_client.close()
+            if proxy_conn and not proxy_conn.closed:
+                proxy_conn.close()
+            return
 
-        tg_web_data = await self.get_tg_web_data(proxy=proxy)
-
-        http_client.headers["User-Agent"] = generate_random_user_agent(device_type='android', browser_type='chrome')
-        http_client.headers['Authorization'] = f'Token {tg_web_data}'
+        http_client.headers['Authorization'] = f'Token {init_data}'
 
         while True:
             try:
@@ -319,98 +377,19 @@ class Tapper:
                         ads_count -= 1
 
                 if settings.AUTO_UPGRADE_REDUCE_COOLDOWN:
-                    while True:
-                        (current_tap_power, future_tap_power, current_tap_duration, future_tap_duration,
-                         current_tap_cooldown, future_tap_cooldown) = await self.get_upgrades(http_client)
-                        user = await self.user(http_client=http_client)
-                        if user is None:
-                            continue
-
-                        balance = int(float(user["balance"]))
-                        level = current_tap_cooldown.get('level')
-                        price = int(float(current_tap_cooldown.get('price')))
-
-                        if level >= settings.AUTO_UPGRADE_REDUCE_COOLDOWN_LEVEL:
-                            break
-                        else:
-                            if balance >= price:
-                                status = await self.do_upgrade(http_client=http_client, type="tapCoolDown")
-                                if status:
-                                    logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Successfully '
-                                                   f'upgraded game cooldown, level - {level+1}, balance - {balance-price}')
-                                else:
-                                    logger.error(f'<light-yellow>{self.session_name}</light-yellow> | Something wrong '
-                                                 f'in upgrade')
-                                    break
-                            else:
-                                logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Not enough money to up'
-                                            f'grade game cooldown')
-                                break
-
-
+                    await self.upgrade_to_level(http_client, "tapCoolDown", "AUTO_UPGRADE_REDUCE_COOLDOWN_LEVEL",
+                                                   "game cooldown", "game cooldown")
 
                 if settings.AUTO_UPGRADE_CLICKING_POWER:
-                    while True:
-                        (current_tap_power, future_tap_power, current_tap_duration, future_tap_duration,
-                         current_tap_cooldown, future_tap_cooldown) = await self.get_upgrades(http_client)
-                        user = await self.user(http_client=http_client)
-                        if user is None:
-                            continue
-
-                        balance = int(float(user["balance"]))
-
-                        level = current_tap_power.get('level')
-                        price = int(float(current_tap_power.get('price')))
-
-                        if level >= settings.AUTO_UPGRADE_CLICKING_POWER_LEVEL:
-                            break
-                        else:
-                            if balance >= price:
-                                status = await self.do_upgrade(http_client=http_client, type="tapPower")
-                                if status:
-                                    logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Successfully '
-                                                   f'upgraded game tap power, level - {level+1}, balance - {balance-price}')
-                                else:
-                                    logger.error(f'<light-yellow>{self.session_name}</light-yellow> | Something wrong '
-                                                 f'in upgrade')
-                                    break
-                            else:
-                                logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Not enough money to up'
-                                            f'grade game tap power')
-                                break
+                    await self.upgrade_to_level(http_client, "tapPower", "AUTO_UPGRADE_CLICKING_POWER_LEVEL",
+                                                   "game tap power", "game tap power")
 
                 if settings.AUTO_UPGRADE_TIMER:
-                    while True:
-                        (current_tap_power, future_tap_power, current_tap_duration, future_tap_duration,
-                         current_tap_cooldown, future_tap_cooldown) = await self.get_upgrades(http_client)
-                        user = await self.user(http_client=http_client)
-                        if user is None:
-                            continue
-
-                        balance = int(float(user["balance"]))
-
-                        level = current_tap_duration.get('level')
-                        price = int(float(current_tap_duration.get('price')))
-
-                        if level >= settings.AUTO_UPGRADE_TIMER_LEVEL:
-                            break
-                        else:
-                            if balance >= price:
-                                status = await self.do_upgrade(http_client=http_client, type="tapDuration")
-                                if status:
-                                    logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Successfully '
-                                                   f'upgraded game duration, level - {level+1}, balance - {balance-price}')
-                                else:
-                                    logger.error(f'<light-yellow>{self.session_name}</light-yellow> | Something wrong '
-                                                 f'in upgrade')
-                                    break
-                            else:
-                                logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Not enough money to up'
-                                            f'grade game duration')
-                                break
+                    await self.upgrade_to_level(http_client, "tapDuration", "AUTO_UPGRADE_TIMER_LEVEL",
+                                                   "game duration", "game duration")
 
                 if next_tap_delay is None or next_tap_delay.seconds > 3600:
-                    sleep_time = randint(3500, 3600)
+                    sleep_time = random.randint(3500, 3600)
                 else:
                     sleep_time = next_tap_delay.seconds
 
@@ -425,8 +404,9 @@ class Tapper:
                 await asyncio.sleep(delay=3)
 
 
-async def run_tapper(tg_client: Client, proxy: str | None):
+async def run_tapper(tg_client: TelegramClient):
     try:
-        await Tapper(tg_client=tg_client).run(proxy=proxy)
+        await Tapper(tg_client=tg_client).run()
     except InvalidSession:
-        logger.error(f"{tg_client.name} | Invalid Session")
+        session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
+        logger.error(f"{session_name} | Invalid Session")
