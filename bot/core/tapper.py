@@ -2,11 +2,9 @@ from datetime import datetime, timezone
 
 import aiohttp
 import asyncio
-import functools
 import json
 import os
 import random
-import time
 from urllib.parse import unquote
 
 import pytz
@@ -17,12 +15,11 @@ from better_proxy import Proxy
 from telethon import TelegramClient
 from telethon.errors import *
 from telethon.types import InputUser, InputBotAppShortName, InputPeerUser
-from telethon.functions import messages, contacts, channels
+from telethon.functions import messages, contacts
 
 from .agents import generate_random_user_agent
 from bot.config import settings
-from typing import Callable
-from bot.utils import logger, proxy_utils, config_utils
+from bot.utils import logger, log_error, proxy_utils, config_utils, CONFIG_PATH
 from bot.exceptions import InvalidSession
 from .headers import headers, get_sec_ch_ua
 
@@ -31,7 +28,7 @@ class Tapper:
     def __init__(self, tg_client: TelegramClient):
         self.tg_client = tg_client
         self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
-        self.config = config_utils.get_session_config(self.session_name)
+        self.config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
         self.proxy = self.config.get('proxy', None)
         self.headers = headers
         self.headers['User-Agent'] = self.check_user_agent()
@@ -42,9 +39,12 @@ class Tapper:
         if not user_agent:
             user_agent = generate_random_user_agent()
             self.config['user_agent'] = user_agent
-            config_utils.update_config_file(self.session_name, self.config)
+            config_utils.update_config_file(self.session_name, self.config, CONFIG_PATH)
 
         return user_agent
+
+    def log_message(self, message) -> str:
+        return f"<light-yellow>{self.session_name}</light-yellow> | {message}"
 
     async def get_tg_web_data(self) -> str | None:
 
@@ -74,8 +74,8 @@ class Tapper:
                 except FloodWaitError as fl:
                     fls = fl.seconds
 
-                    logger.warning(f"<light-yellow>{self.session_name}</light-yellow> | FloodWait {fl}")
-                    logger.info(f"<light-yellow>{self.session_name}</light-yellow> | Sleep {fls}s")
+                    logger.warning(self.log_message(f"FloodWait {fl}"))
+                    logger.info(self.log_message(f"Sleep {fls}s"))
                     await asyncio.sleep(fls + 3)
 
             start_param = settings.REF_ID if random.randint(0, 100) <= 85 else "525256526"
@@ -104,8 +104,7 @@ class Tapper:
             return None
 
         except Exception as error:
-            logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Unknown error during Authorization: "
-                         f"{error}")
+            log_error(self.log_message(f"Unknown error during Authorization: {error}"))
             return None
 
     async def user(self, http_client: aiohttp.ClientSession):
@@ -117,7 +116,7 @@ class Tapper:
             app_user_data = json.loads(response_text)
             return app_user_data
         except Exception as error:
-            logger.error(f"Auth request error happened: {error}")
+            log_error(self.log_message(f"Auth request error happened: {error}"))
             return None
 
     async def claim_daily(self, http_client: aiohttp.ClientSession):
@@ -127,7 +126,7 @@ class Tapper:
                 return True
             return False
         except Exception as error:
-            logger.error(f"Daily claim error happened: {error}")
+            log_error(self.log_message(f"Daily claim error happened: {error}"))
             return None
 
     async def get_quests(self, http_client: aiohttp.ClientSession):
@@ -142,7 +141,7 @@ class Tapper:
             return quests_with_timer
 
         except Exception as error:
-            logger.error(f"Get quests error happened: {error}")
+            log_error(self.log_message(f"Get quests error happened: {error}"))
             return None
 
     async def finish_quests(self, http_client: aiohttp.ClientSession, quest_name: str):
@@ -155,7 +154,7 @@ class Tapper:
                 return True
 
         except Exception as error:
-            logger.error(f"Finish quests error happened: {error}")
+            log_error(self.log_message(f"Finish quests error happened: {error}"))
             return None
 
     async def sync_clicks(self, http_client: aiohttp.ClientSession):
@@ -170,7 +169,7 @@ class Tapper:
                         random_clicks)
 
         except Exception as error:
-            logger.error(f"Sync clicks error happened: {error}")
+            log_error(self.log_message(f"Sync clicks error happened: {error}"))
             return None
 
     async def get_ads_limit(self, http_client: aiohttp.ClientSession):
@@ -179,7 +178,7 @@ class Tapper:
             resp_json = await response.json()
             return resp_json.get('available')
         except Exception as error:
-            logger.error(f"Get ads limit error happened: {error}")
+            log_error(self.log_message(f"Get ads limit error happened: {error}"))
             return 0
 
     async def get_upgrades(self, http_client: aiohttp.ClientSession):
@@ -197,7 +196,7 @@ class Tapper:
             return (current_tap_power, future_tap_power, current_tap_duration, future_tap_duration,
                     current_tap_cooldown, future_tap_cooldown)
         except Exception as error:
-            logger.error(f"Get upgrades error happened: {error}")
+            log_error(self.log_message(f"Get upgrades error happened: {error}"))
             return None
 
     async def do_upgrade(self, http_client: aiohttp.ClientSession, type: str):
@@ -209,7 +208,7 @@ class Tapper:
             else:
                 return False
         except Exception as error:
-            logger.error(f"Do upgrade error happened: {error}")
+            log_error(self.log_message(f"Do upgrade error happened: {error}"))
             return False
 
     async def watch_ad(self, http_client: aiohttp.ClientSession):
@@ -219,7 +218,7 @@ class Tapper:
             if resp_json.get('message') == 'Ad bonus applied!':
                 return True
         except Exception as error:
-            logger.error(f"Watch ads error happened: {error}")
+            log_error(self.log_message(f"Watch ads error happened: {error}"))
             return None
 
     async def get_rewards(self, http_client: aiohttp.ClientSession):
@@ -228,7 +227,7 @@ class Tapper:
             resp_json = await response.json()
             return resp_json
         except Exception as error:
-            logger.error(f'Get rewards error happened: {error}')
+            log_error(self.log_message(f'Get rewards error happened: {error}'))
 
     async def upgrade_to_level(self, http_client, upgrade_type, setting_key, level_key, log_message):
         while True:
@@ -251,24 +250,23 @@ class Tapper:
                 if balance >= price:
                     status = await self.do_upgrade(http_client=http_client, type=upgrade_type)
                     if status:
-                        logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Successfully '
-                                       f'upgraded {log_message}, level - {level + 1}, balance - {balance - price}')
+                        logger.success( self.log_message(f'Successfully upgraded {log_message}, level - {level + 1}, '
+                                                         f'balance - {balance - price}'))
                     else:
-                        logger.error(f'<light-yellow>{self.session_name}</light-yellow> | Something wrong in upgrade')
+                        log_error(self.log_message('Something wrong in upgrade'))
                         break
                 else:
-                    logger.info(
-                        f'<light-yellow>{self.session_name}</light-yellow> | Not enough money to upgrade {log_message}')
+                    logger.info(self.log_message(f'Not enough money to upgrade {log_message}'))
                     break
 
     async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: str) -> bool:
         try:
             response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
             ip = (await response.json()).get('origin')
-            logger.info(f"<light-yellow>{self.session_name}</light-yellow> | Proxy IP: {ip}")
+            logger.info(self.log_message(f"Proxy IP: {ip}"))
             return True
         except Exception as error:
-            logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Proxy: {proxy} | Error: {error}")
+            log_error(self.log_message(f"Proxy: {proxy} | Error: {error}"))
             return False
 
     async def run(self) -> None:
@@ -301,8 +299,7 @@ class Tapper:
                 if user is None:
                     continue
 
-                logger.info(
-                    f'<light-yellow>{self.session_name}</light-yellow> | Balance - {int(float(user["balance"]))}')
+                logger.info(self.log_message(f'Balance - {int(float(user["balance"]))}'))
 
                 await asyncio.sleep(1.5)
 
@@ -310,9 +307,9 @@ class Tapper:
                 if rewards.get('current') != "0":
                     claim_daily = await self.claim_daily(http_client=http_client)
                     if claim_daily:
-                        logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Claimed daily')
+                        logger.info(self.log_message('Claimed daily'))
                 else:
-                    logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Daily bonus not available')
+                    logger.info(self.log_message('Daily bonus not available'))
 
                 await asyncio.sleep(1.5)
 
@@ -321,8 +318,7 @@ class Tapper:
                     for quest_name in quests:
                         status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
                         if status is True:
-                            logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Successfully done '
-                                        f'{quest_name} quest')
+                            logger.info(self.log_message(f'Successfully done {quest_name} quest'))
                 elif user['quests']:
                     quests = await self.get_quests(http_client=http_client)
                     completed_quests = []
@@ -336,8 +332,7 @@ class Tapper:
                     for quest_name in new_quests:
                         status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
                         if status is True:
-                            logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Successfully done '
-                                        f'{quest_name} quest')
+                            logger.info(self.log_message(f'Successfully done {quest_name} quest'))
 
                 await asyncio.sleep(1.5)
                 next_tap_delay = None
@@ -354,10 +349,10 @@ class Tapper:
                         status, clicks = await self.sync_clicks(http_client=http_client)
                         if status is True:
                             user = await self.user(http_client=http_client)
-                            logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Played game, got - '
-                                           f'{clicks} diamonds, balance - {int(float(user["balance"]))}')
+                            logger.success(self.log_message(f'Played game, got - {clicks} diamonds, '
+                                                            f'balance - {int(float(user["balance"]))}'))
                     else:
-                        logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Game on cooldown')
+                        logger.info(self.log_message('Game on cooldown'))
                         next_tap_delay = limit_date - current_time_utc
 
                 await asyncio.sleep(1.5)
@@ -367,13 +362,10 @@ class Tapper:
                     while ads_count > 0:
                         status = await self.watch_ad(http_client)
                         if status:
-                            logger.success(
-                                f'<light-yellow>{self.session_name}</light-yellow> | Watched ad to skip game '
-                                f'cooldown')
+                            logger.success(self.log_message(f'Watched ad to skip game cooldown'))
                             status, clicks = await self.sync_clicks(http_client=http_client)
                             user = await self.user(http_client=http_client)
-                            logger.success(f'<light-yellow>{self.session_name}</light-yellow> | Played game, got - '
-                                           f'{clicks} diamonds, balance - {int(float(user["balance"]))}')
+                            logger.success(self.log_message(f'Played game, got - {clicks} diamonds, balance - {int(float(user["balance"]))}'))
                         ads_count -= 1
 
                 if settings.AUTO_UPGRADE_REDUCE_COOLDOWN:
@@ -393,14 +385,14 @@ class Tapper:
                 else:
                     sleep_time = next_tap_delay.seconds
 
-                logger.info(f'<light-yellow>{self.session_name}</light-yellow> | Sleep {round(sleep_time / 60, 2)} min')
+                logger.info(self.log_message(f'Sleep {round(sleep_time / 60, 2)} min'))
                 await asyncio.sleep(sleep_time)
 
             except InvalidSession as error:
                 raise error
 
             except Exception as error:
-                logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Unknown error: {error}")
+                log_error(self.log_message(f"Unknown error: {error}"))
                 await asyncio.sleep(delay=3)
 
 
@@ -409,4 +401,4 @@ async def run_tapper(tg_client: TelegramClient):
         await Tapper(tg_client=tg_client).run()
     except InvalidSession:
         session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
-        logger.error(f"{session_name} | Invalid Session")
+        logger.error(f"<light-yellow>{session_name}</light-yellow> | Invalid Session")
