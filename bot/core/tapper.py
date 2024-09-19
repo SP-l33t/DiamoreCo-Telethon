@@ -274,6 +274,10 @@ class Tapper:
             return False
 
     async def run(self) -> None:
+        random_delay = random.randint(1, settings.RANDOM_DELAY_IN_RUN)
+        logger.info(self.log_message(f"Bot will start in <ly>{random_delay}s</ly>"))
+        await asyncio.sleep(random_delay)
+
         proxy_conn = None
         if self.proxy:
             proxy_conn = ProxyConnector().from_url(self.proxy)
