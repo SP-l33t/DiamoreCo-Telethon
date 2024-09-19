@@ -244,20 +244,20 @@ class Tapper:
                 continue
 
             balance = int(float(user["balance"]))
-            upgrade_info = locals()[f"current_{upgrade_type}"]
+            upgrade_info = locals()[f"future_{upgrade_type}"]
             level = upgrade_info.get('level')
             price = int(float(upgrade_info.get('price')))
 
             if level >= getattr(settings, setting_key):
                 break
             else:
-                if balance >= price:
+                if balance > price:
                     status = await self.do_upgrade(http_client=http_client, type=upgrade_type)
                     if status:
                         logger.success( self.log_message(f'Successfully upgraded {log_message}, level - {level + 1}, '
                                                          f'balance - {balance - price}'))
                     else:
-                        log_error(self.log_message('Something wrong in upgrade'))
+                        logger.warning(self.log_message(f'Something wrong in upgrade. Balance: {balance}. Upgrade price: {price}'))
                         break
                 else:
                     logger.info(self.log_message(f'Not enough money to upgrade {log_message}'))
