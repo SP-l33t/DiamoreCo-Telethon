@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     API_HASH: str
     GLOBAL_CONFIG_PATH: str = "TG_FARM"
 
-    CLICKS: list[int] = [300, 1000]
+    CLICKS: list[int] = [400, 1200]
 
     AUTO_UPGRADE_CLICKING_POWER: bool = False
     AUTO_UPGRADE_CLICKING_POWER_LEVEL: int = 20

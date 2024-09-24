@@ -11,6 +11,7 @@ from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
 from datetime import datetime, timezone
+from time import time
 
 from telethon import TelegramClient
 from telethon.errors import *
@@ -34,6 +35,8 @@ class Tapper:
         self.headers = headers
         self.headers['User-Agent'] = self.check_user_agent()
         self.headers.update(**get_sec_ch_ua(self.headers.get('User-Agent', '')))
+
+        self._webview_data = None
 
     def check_user_agent(self):
         user_agent = self.config.get('user_agent')
@@ -60,28 +63,27 @@ class Tapper:
         tg_web_data = None
         with self.lock:
             async with self.tg_client as client:
-                while True:
-                    try:
-                        resolve_result = await client(contacts.ResolveUsernameRequest(username='DiamoreCryptoBot'))
-                        peer = InputPeerUser(user_id=resolve_result.peer.user_id,
-                                             access_hash=resolve_result.users[0].access_hash)
-                        break
-                    except FloodWaitError as fl:
-                        fls = fl.seconds
+                if not self._webview_data:
+                    while True:
+                        try:
+                            resolve_result = await client(contacts.ResolveUsernameRequest(username='DiamoreCryptoBot'))
+                            user = resolve_result.users[0]
+                            peer = InputPeerUser(user_id=user.id, access_hash=user.access_hash)
+                            input_user = InputUser(user_id=user.id, access_hash=user.access_hash)
+                            input_bot_app = InputBotAppShortName(bot_id=input_user, short_name="app")
+                            self._webview_data = {'peer': peer, 'app': input_bot_app}
+                            break
+                        except FloodWaitError as fl:
+                            fls = fl.seconds
 
-                        logger.warning(self.log_message(f"FloodWait {fl}"))
-                        logger.info(self.log_message(f"Sleep {fls}s"))
-                        await asyncio.sleep(fls + 3)
+                            logger.warning(self.log_message(f"FloodWait {fl}"))
+                            logger.info(self.log_message(f"Sleep {fls}s"))
+                            await asyncio.sleep(fls + 3)
 
                 start_param = settings.REF_ID if random.randint(0, 100) <= 85 else "525256526"
 
-                input_user = InputUser(user_id=resolve_result.peer.user_id,
-                                       access_hash=resolve_result.users[0].access_hash)
-                input_bot_app = InputBotAppShortName(bot_id=input_user, short_name="app")
-
                 web_view = await client(messages.RequestAppWebViewRequest(
-                    peer=peer,
-                    app=input_bot_app,
+                    **self._webview_data,
                     platform='android',
                     write_allowed=True,
                     start_param=start_param
@@ -246,14 +248,15 @@ class Tapper:
                     logger.info(self.log_message(f'Not enough money to upgrade {log_message}'))
                     break
 
-    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: str) -> bool:
+    async def check_proxy(self, http_client: aiohttp.ClientSession) -> bool:
+        proxy_conn = http_client._connector
         try:
-            response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
-            ip = (await response.json()).get('origin')
-            logger.info(self.log_message(f"Proxy IP: {ip}"))
+            response = await http_client.get(url='https://ifconfig.me/ip', timeout=aiohttp.ClientTimeout(15))
+            logger.info(self.log_message(f"Proxy IP: {await response.text()}"))
             return True
         except Exception as error:
-            log_error(self.log_message(f"Proxy: {proxy} | Error: {error}"))
+            proxy_url = f"{proxy_conn._proxy_type}://{proxy_conn._proxy_host}:{proxy_conn._proxy_port}"
+            log_error(self.log_message(f"Proxy: {proxy_url} | Error: {type(error).__name__}"))
             return False
 
     async def run(self) -> None:
@@ -261,131 +264,131 @@ class Tapper:
         logger.info(self.log_message(f"Bot will start in <ly>{random_delay}s</ly>"))
         await asyncio.sleep(random_delay)
 
-        proxy_conn = None
-        if self.proxy:
-            proxy_conn = ProxyConnector().from_url(self.proxy)
-            http_client = CloudflareScraper(headers=self.headers, connector=proxy_conn)
-            p_type = proxy_conn._proxy_type
-            p_host = proxy_conn._proxy_host
-            p_port = proxy_conn._proxy_port
-            if not await self.check_proxy(http_client=http_client, proxy=f"{p_type}://{p_host}:{p_port}"):
-                return
-        else:
-            http_client = CloudflareScraper(headers=self.headers)
+        access_token_created_time = 0
+        init_data = None
+        token_live_time = random.randint(3500, 3600)
 
-        init_data = await self.get_tg_web_data()
-
-        if not init_data:
-            if not http_client.closed:
-                await http_client.close()
-            if proxy_conn and not proxy_conn.closed:
-                proxy_conn.close()
-            return
-
-        http_client.headers['Authorization'] = f'Token {init_data}'
 
         while True:
-            try:
-                user = await self.user(http_client=http_client)
-                if user is None:
+            proxy_conn = {'connector': ProxyConnector.from_url(self.proxy)} if self.proxy else {}
+            async with CloudflareScraper(headers=self.headers, timeout=aiohttp.ClientTimeout(60), **proxy_conn) as http_client:
+                if not await self.check_proxy(http_client=http_client):
+                    logger.warning(self.log_message('Failed to connect to proxy server. Sleep 5 minutes.'))
+                    await asyncio.sleep(300)
                     continue
 
-                logger.info(self.log_message(f'Balance - {int(float(user["balance"]))}'))
+                try:
+                    if time() - access_token_created_time >= token_live_time:
+                        init_data = await self.get_tg_web_data()
 
-                await asyncio.sleep(1.5)
+                        if not init_data:
+                            raise InvalidSession('Failed to get webview URL')
 
-                rewards = await self.get_rewards(http_client)
-                if rewards.get('current') != "0":
-                    claim_daily = await self.claim_daily(http_client=http_client)
-                    if claim_daily:
-                        logger.info(self.log_message('Claimed daily'))
-                else:
-                    logger.info(self.log_message('Daily bonus not available'))
+                    http_client.headers['Authorization'] = f'Token {init_data}'
 
-                await asyncio.sleep(1.5)
+                    access_token_created_time = time()
+                    token_live_time = random.randint(3500, 3600)
 
-                if not user['quests']:
-                    quests = await self.get_quests(http_client=http_client)
-                    for quest_name in quests:
-                        status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
-                        if status is True:
-                            logger.info(self.log_message(f'Successfully done {quest_name} quest'))
-                elif user['quests']:
-                    quests = await self.get_quests(http_client=http_client)
-                    completed_quests = []
-                    new_quests = []
-                    for quest in user['quests']:
-                        if quest['status'] == 'completed':
-                            completed_quests.append(quest['name'])
-                    for quest_name in quests:
-                        if quest_name not in completed_quests:
-                            new_quests.append(quest_name)
-                    for quest_name in new_quests:
-                        status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
-                        if status is True:
-                            logger.info(self.log_message(f'Successfully done {quest_name} quest'))
+                    user = await self.user(http_client=http_client)
+                    if user is None:
+                        continue
 
-                await asyncio.sleep(1.5)
-                next_tap_delay = None
-                limit_date_str = user.get("limitDate")
-                if limit_date_str or limit_date_str is None:
-                    if limit_date_str:
-                        limit_date = datetime.fromisoformat(limit_date_str.replace("Z", "+00:00"))
+                    logger.info(self.log_message(f'Balance - {int(float(user["balance"]))}'))
+
+                    await asyncio.sleep(1.5)
+
+                    rewards = await self.get_rewards(http_client)
+                    if rewards.get('current') != "0":
+                        claim_daily = await self.claim_daily(http_client=http_client)
+                        if claim_daily:
+                            logger.info(self.log_message('Claimed daily'))
                     else:
-                        limit_date = datetime.min.replace(tzinfo=timezone.utc)
+                        logger.info(self.log_message('Daily bonus not available'))
 
-                    current_time_utc = datetime.now(pytz.utc)
+                    await asyncio.sleep(1.5)
 
-                    if current_time_utc > limit_date:
-                        status, clicks = await self.sync_clicks(http_client=http_client)
-                        if status is True:
-                            user = await self.user(http_client=http_client)
-                            logger.success(self.log_message(f'Played game, got - {clicks} diamonds, '
-                                                            f'balance - {int(float(user["balance"]))}'))
-                    else:
-                        logger.info(self.log_message('Game on cooldown'))
-                        next_tap_delay = limit_date - current_time_utc
+                    if not user['quests']:
+                        quests = await self.get_quests(http_client=http_client)
+                        for quest_name in quests:
+                            status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
+                            if status is True:
+                                logger.info(self.log_message(f'Successfully done {quest_name} quest'))
+                    elif user['quests']:
+                        quests = await self.get_quests(http_client=http_client)
+                        completed_quests = []
+                        new_quests = []
+                        for quest in user['quests']:
+                            if quest['status'] == 'completed':
+                                completed_quests.append(quest['name'])
+                        for quest_name in quests:
+                            if quest_name not in completed_quests:
+                                new_quests.append(quest_name)
+                        for quest_name in new_quests:
+                            status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
+                            if status is True:
+                                logger.info(self.log_message(f'Successfully done {quest_name} quest'))
 
-                await asyncio.sleep(1.5)
+                    await asyncio.sleep(1.5)
+                    next_tap_delay = None
+                    limit_date_str = user.get("limitDate")
+                    if limit_date_str or limit_date_str is None:
+                        if limit_date_str:
+                            limit_date = datetime.fromisoformat(limit_date_str.replace("Z", "+00:00"))
+                        else:
+                            limit_date = datetime.min.replace(tzinfo=timezone.utc)
 
-                ads_count = await self.get_ads_limit(http_client)
-                if ads_count:
-                    while ads_count > 0:
-                        status = await self.watch_ad(http_client)
-                        if status:
-                            logger.success(self.log_message(f'Watched ad to skip game cooldown'))
+                        current_time_utc = datetime.now(pytz.utc)
+
+                        if current_time_utc > limit_date:
                             status, clicks = await self.sync_clicks(http_client=http_client)
-                            user = await self.user(http_client=http_client)
-                            logger.success(self.log_message(
-                                f'Played game, got - {clicks} diamonds, balance - {int(float(user["balance"]))}'))
-                        ads_count -= 1
+                            if status is True:
+                                user = await self.user(http_client=http_client)
+                                logger.success(self.log_message(f'Played game, got - {clicks} diamonds, '
+                                                                f'balance - {int(float(user["balance"]))}'))
+                        else:
+                            logger.info(self.log_message('Game on cooldown'))
+                            next_tap_delay = limit_date - current_time_utc
 
-                if settings.AUTO_UPGRADE_REDUCE_COOLDOWN:
-                    await self.upgrade_to_level(http_client, "tapCoolDown", "AUTO_UPGRADE_REDUCE_COOLDOWN_LEVEL",
-                                                "game cooldown", "game cooldown")
+                    await asyncio.sleep(1.5)
 
-                if settings.AUTO_UPGRADE_CLICKING_POWER:
-                    await self.upgrade_to_level(http_client, "tapPower", "AUTO_UPGRADE_CLICKING_POWER_LEVEL",
-                                                "game tap power", "game tap power")
+                    ads_count = await self.get_ads_limit(http_client)
+                    if ads_count:
+                        while ads_count > 0:
+                            status = await self.watch_ad(http_client)
+                            if status:
+                                logger.success(self.log_message(f'Watched ad to skip game cooldown'))
+                                status, clicks = await self.sync_clicks(http_client=http_client)
+                                user = await self.user(http_client=http_client)
+                                logger.success(self.log_message(
+                                    f'Played game, got - {clicks} diamonds, balance - {int(float(user["balance"]))}'))
+                            ads_count -= 1
 
-                if settings.AUTO_UPGRADE_TIMER:
-                    await self.upgrade_to_level(http_client, "tapDuration", "AUTO_UPGRADE_TIMER_LEVEL",
-                                                "game duration", "game duration")
+                    if settings.AUTO_UPGRADE_REDUCE_COOLDOWN:
+                        await self.upgrade_to_level(http_client, "tapCoolDown", "AUTO_UPGRADE_REDUCE_COOLDOWN_LEVEL",
+                                                    "game cooldown", "game cooldown")
 
-                if next_tap_delay is None or next_tap_delay.seconds > 3600:
-                    sleep_time = random.randint(3500, 3600)
-                else:
-                    sleep_time = next_tap_delay.seconds
+                    if settings.AUTO_UPGRADE_CLICKING_POWER:
+                        await self.upgrade_to_level(http_client, "tapPower", "AUTO_UPGRADE_CLICKING_POWER_LEVEL",
+                                                    "game tap power", "game tap power")
 
-                logger.info(self.log_message(f'Sleep {round(sleep_time / 60, 2)} min'))
-                await asyncio.sleep(sleep_time)
+                    if settings.AUTO_UPGRADE_TIMER:
+                        await self.upgrade_to_level(http_client, "tapDuration", "AUTO_UPGRADE_TIMER_LEVEL",
+                                                    "game duration", "game duration")
 
-            except InvalidSession as error:
-                raise error
+                    if next_tap_delay is None or next_tap_delay.seconds > 3600:
+                        sleep_time = random.randint(3500, 3600)
+                    else:
+                        sleep_time = next_tap_delay.seconds
 
-            except Exception as error:
-                log_error(self.log_message(f"Unknown error: {error}"))
-                await asyncio.sleep(delay=3)
+                    logger.info(self.log_message(f'Sleep {round(sleep_time / 60, 2)} min'))
+                    await asyncio.sleep(sleep_time)
+
+                except InvalidSession as error:
+                    raise error
+
+                except Exception as error:
+                    log_error(self.log_message(f"Unknown error: {error}"))
+                    await asyncio.sleep(delay=3)
 
 
 async def run_tapper(tg_client: TelegramClient):
