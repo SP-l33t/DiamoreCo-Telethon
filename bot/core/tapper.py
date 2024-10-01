@@ -15,12 +15,12 @@ from time import time
 
 from telethon import TelegramClient
 from telethon.errors import *
-from telethon.types import InputUser, InputBotAppShortName, InputPeerUser
-from telethon.functions import messages, contacts
+from telethon.types import InputBotAppShortName
+from telethon.functions import messages
 
 from .agents import generate_random_user_agent
 from bot.config import settings
-from bot.utils import logger, log_error, proxy_utils, config_utils, CONFIG_PATH
+from bot.utils import logger, log_error, proxy_utils, config_utils, AsyncInterProcessLock, CONFIG_PATH
 from bot.exceptions import InvalidSession
 from .headers import headers, get_sec_ch_ua
 
@@ -30,11 +30,9 @@ class Tapper:
         self.tg_client = tg_client
         self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
         self.config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
-        self.proxy = self.config.get('proxy', None)
-        self.lock = fasteners.InterProcessLock(os.path.join(os.path.dirname(CONFIG_PATH), 'lock_files',  f"{self.session_name}.lock"))
+        self.proxy = self.config.get('proxy')
+        self.lock = AsyncInterProcessLock(os.path.join(os.path.dirname(CONFIG_PATH), 'lock_files',  f"{self.session_name}.lock"))
         self.headers = headers
-        self.headers['User-Agent'] = self.check_user_agent()
-        self.headers.update(**get_sec_ch_ua(self.headers.get('User-Agent', '')))
 
         self._webview_data = None
 
@@ -43,14 +41,15 @@ class Tapper:
             proxy_dict = proxy_utils.to_telethon_proxy(proxy)
             self.tg_client.set_proxy(proxy_dict)
 
-    def check_user_agent(self):
+    async def check_user_agent(self):
         user_agent = self.config.get('user_agent')
         if not user_agent:
             user_agent = generate_random_user_agent()
             self.config['user_agent'] = user_agent
-            config_utils.update_session_config_in_file(self.session_name, self.config, CONFIG_PATH)
+            await config_utils.update_session_config_in_file(self.session_name, self.config, CONFIG_PATH)
 
-        return user_agent
+        self.headers['User-Agent'] = user_agent
+        self.headers.update(**get_sec_ch_ua(user_agent))
 
     def log_message(self, message) -> str:
         return f"<light-yellow>{self.session_name}</light-yellow> | {message}"
@@ -77,7 +76,7 @@ class Tapper:
 
     async def get_tg_web_data(self) -> str | None:
         tg_web_data = None
-        with self.lock:
+        async with self.lock:
             try:
                 if not self.tg_client.is_connected():
                     await self.tg_client.connect()
@@ -106,7 +105,7 @@ class Tapper:
             finally:
                 if self.tg_client.is_connected():
                     await self.tg_client.disconnect()
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(15)
 
         return tg_web_data
 
@@ -253,11 +252,11 @@ class Tapper:
                 if balance > price:
                     status = await self.do_upgrade(http_client=http_client, type=upgrade_type)
                     if status:
-                        logger.success(self.log_message(f'Successfully upgraded {log_message}, level - {level + 1}, '
-                                                        f'balance - {balance - price}'))
+                        logger.success(self.log_message(f'Successfully upgraded <lc>{log_message}</lc>, level - <lc>{level + 1}</lc>, '
+                                                        f'balance - <lc>{balance - price}</lc>'))
                     else:
                         logger.warning(
-                            self.log_message(f'Something wrong in upgrade. Balance: {balance}. Upgrade price: {price}'))
+                            self.log_message(f'Something wrong in upgrade. Balance: <lc>{balance}</lc>. Upgrade price: <lc>{price}</lc>'))
                         break
                 else:
                     logger.info(self.log_message(f'Not enough money to upgrade {log_message}'))
@@ -278,6 +277,7 @@ class Tapper:
             return False
 
     async def run(self) -> None:
+        await self.check_user_agent()
         random_delay = random.randint(1, settings.RANDOM_DELAY_IN_RUN)
         logger.info(self.log_message(f"Bot will start in <ly>{random_delay}s</ly>"))
         await asyncio.sleep(random_delay)
@@ -312,7 +312,7 @@ class Tapper:
                     if user is None:
                         continue
 
-                    logger.info(self.log_message(f'Balance - {int(float(user["balance"]))}'))
+                    logger.info(self.log_message(f'Balance - <lc>{int(float(user["balance"]))}</lc>'))
 
                     await asyncio.sleep(1.5)
 
@@ -331,7 +331,7 @@ class Tapper:
                         for quest_name in quests:
                             status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
                             if status is True:
-                                logger.info(self.log_message(f'Successfully done {quest_name} quest'))
+                                logger.info(self.log_message(f'Successfully done <lc>{quest_name}</lc> quest'))
                     elif user['quests']:
                         quests = await self.get_quests(http_client=http_client)
                         completed_quests = []
@@ -345,7 +345,7 @@ class Tapper:
                         for quest_name in new_quests:
                             status = await self.finish_quests(http_client=http_client, quest_name=quest_name)
                             if status is True:
-                                logger.info(self.log_message(f'Successfully done {quest_name} quest'))
+                                logger.info(self.log_message(f'Successfully done <lc>{quest_name}</lc> quest'))
 
                     await asyncio.sleep(1.5)
                     next_tap_delay = None
@@ -362,8 +362,8 @@ class Tapper:
                             status, clicks = await self.sync_clicks(http_client=http_client)
                             if status is True:
                                 user = await self.user(http_client=http_client)
-                                logger.success(self.log_message(f'Played game, got - {clicks} diamonds, '
-                                                                f'balance - {int(float(user["balance"]))}'))
+                                logger.success(self.log_message(f'Played game, got - <lc>{clicks}</lc> diamonds, '
+                                                                f'balance - <lc>{int(float(user["balance"]))}</lc>'))
                         else:
                             logger.info(self.log_message('Game on cooldown'))
                             next_tap_delay = limit_date - current_time_utc
@@ -379,7 +379,7 @@ class Tapper:
                                 status, clicks = await self.sync_clicks(http_client=http_client)
                                 user = await self.user(http_client=http_client)
                                 logger.success(self.log_message(
-                                    f'Played game, got - {clicks} diamonds, balance - {int(float(user["balance"]))}'))
+                                    f'Played game, got - <lc>{clicks}</lc> diamonds, balance - <lc>{int(float(user["balance"]))}</lc>'))
                             ads_count -= 1
 
                     if settings.AUTO_UPGRADE_REDUCE_COOLDOWN:
@@ -399,7 +399,7 @@ class Tapper:
                     else:
                         sleep_time = next_tap_delay.seconds
 
-                    logger.info(self.log_message(f'Sleep {round(sleep_time / 60, 2)} min'))
+                    logger.info(self.log_message(f'Sleep <lc>{round(sleep_time / 60, 2)}</lc> min'))
                     await asyncio.sleep(sleep_time)
 
                 except InvalidSession as error:
