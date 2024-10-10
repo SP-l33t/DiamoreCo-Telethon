@@ -12,7 +12,7 @@ from better_proxy import Proxy
 from datetime import datetime, timezone
 from time import time
 
-from telethon import TelegramClient
+from opentele.tl import TelegramClient
 from telethon.errors import *
 from telethon.types import InputBotAppShortName, InputUser
 from telethon.functions import messages
@@ -33,7 +33,7 @@ class Tapper:
 
         session_config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
 
-        if not all(key in session_config for key in ('api_id', 'api_hash', 'user_agent')):
+        if not all(key in session_config for key in ('api', 'user_agent')):
             logger.critical(self.log_message('CHECK accounts_config.json as it might be corrupted'))
             exit(-1)
 
@@ -393,10 +393,10 @@ class Tapper:
                         await self.upgrade_to_level(http_client, "tapDuration", "AUTO_UPGRADE_TIMER_LEVEL",
                                                     "game duration", "game duration")
 
-                    if next_tap_delay is None or next_tap_delay.seconds > 3600:
-                        sleep_time = random.randint(3500, 3600)
+                    if not next_tap_delay:
+                        sleep_time = random.randint(3500, 10800)
                     else:
-                        sleep_time = next_tap_delay.seconds
+                        sleep_time = next_tap_delay.seconds * random.uniform(1, 1.1)
 
                     logger.info(self.log_message(f'Sleep <lc>{round(sleep_time / 60, 2)}</lc> min'))
                     await asyncio.sleep(sleep_time)
