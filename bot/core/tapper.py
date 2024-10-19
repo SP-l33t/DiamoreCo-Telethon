@@ -1,35 +1,29 @@
 import aiohttp
 import asyncio
 import json
-import os
-import random
-from urllib.parse import unquote
+import re
+from urllib.parse import unquote, parse_qs
 
 import pytz
 from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
 from datetime import datetime, timezone
+from random import uniform, randint
 from time import time
 
-from opentele.tl import TelegramClient
-from telethon.errors import *
-from telethon.types import InputBotAppShortName, InputUser
-from telethon.functions import messages
+from bot.utils.universal_telegram_client import UniversalTelegramClient
 
 from bot.config import settings
-from bot.utils import logger, log_error, proxy_utils, config_utils, AsyncInterProcessLock, CONFIG_PATH
+from bot.utils import logger, log_error, config_utils, CONFIG_PATH, first_run
 from bot.exceptions import InvalidSession
 from .headers import headers, get_sec_ch_ua
 
 
 class Tapper:
-    def __init__(self, tg_client: TelegramClient):
+    def __init__(self, tg_client: UniversalTelegramClient):
         self.tg_client = tg_client
-        self.session_name, _ = os.path.splitext(os.path.basename(tg_client.session.filename))
-        self.lock = AsyncInterProcessLock(
-            os.path.join(os.path.dirname(CONFIG_PATH), 'lock_files',  f"{self.session_name}.lock"))
-        self.headers = headers
+        self.session_name = tg_client.session_name
 
         session_config = config_utils.get_session_config(self.session_name, CONFIG_PATH)
 
@@ -37,6 +31,7 @@ class Tapper:
             logger.critical(self.log_message('CHECK accounts_config.json as it might be corrupted'))
             exit(-1)
 
+        self.headers = headers
         user_agent = session_config.get('user_agent')
         self.headers['user-agent'] = user_agent
         self.headers.update(**get_sec_ch_ua(user_agent))
@@ -44,72 +39,24 @@ class Tapper:
         self.proxy = session_config.get('proxy')
         if self.proxy:
             proxy = Proxy.from_str(self.proxy)
-            proxy_dict = proxy_utils.to_telethon_proxy(proxy)
-            self.tg_client.set_proxy(proxy_dict)
+            self.tg_client.set_proxy(proxy)
+
+        self.user_data = None
 
         self._webview_data = None
 
     def log_message(self, message) -> str:
         return f"<ly>{self.session_name}</ly> | {message}"
 
-    async def initialize_webview_data(self):
-        if not self._webview_data:
-            while True:
-                try:
-                    peer = await self.tg_client.get_input_entity('DiamoreCryptoBot')
-                    bot_id = InputUser(user_id=peer.user_id, access_hash=peer.access_hash)
-                    input_bot_app = InputBotAppShortName(bot_id=bot_id, short_name="app")
-                    self._webview_data = {'peer': peer, 'app': input_bot_app}
-                    break
-                except FloodWaitError as fl:
-                    logger.warning(self.log_message(f"FloodWait {fl}. Waiting {fl.seconds}s"))
-                    await asyncio.sleep(fl.seconds + 3)
-                except (UnauthorizedError, AuthKeyUnregisteredError):
-                    raise InvalidSession(f"{self.session_name}: User is unauthorized")
-                except (UserDeactivatedError, UserDeactivatedBanError, PhoneNumberBannedError):
-                    raise InvalidSession(f"{self.session_name}: User is banned")
+    async def get_tg_web_data(self) -> str:
+        webview_url = await self.tg_client.get_app_webview_url('DiamoreCryptoBot', "app", "525256526")
 
-    async def get_tg_web_data(self) -> str | None:
-        if self.proxy and not self.tg_client._proxy:
-            logger.critical(self.log_message('Proxy found, but not passed to TelegramClient'))
-            exit(-1)
-
-        tg_web_data = None
-        async with self.lock:
-            try:
-                if not self.tg_client.is_connected():
-                    await self.tg_client.connect()
-                await self.initialize_webview_data()
-                await asyncio.sleep(random.uniform(1, 2))
-
-                start_param = settings.REF_ID if random.randint(0, 100) <= 85 else "525256526"
-
-                web_view = await self.tg_client(messages.RequestAppWebViewRequest(
-                    **self._webview_data,
-                    platform='android',
-                    write_allowed=True,
-                    start_param=start_param
-                ))
-
-                auth_url = web_view.url
-                tg_web_data = unquote(
-                    string=auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0])
-
-            except InvalidSession:
-                raise
-
-            except Exception as error:
-                log_error(self.log_message(f"Unknown error during Authorization: {error}"))
-                await asyncio.sleep(delay=3)
-
-            finally:
-                if self.tg_client.is_connected():
-                    await self.tg_client.disconnect()
-                    await asyncio.sleep(15)
+        tg_web_data = unquote(string=webview_url.split('tgWebAppData=')[1].split('&tgWebAppVersion')[0])
+        self.user_data = json.loads(parse_qs(tg_web_data).get('user', [''])[0])
 
         return tg_web_data
 
-    async def user(self, http_client: aiohttp.ClientSession):
+    async def user(self, http_client: CloudflareScraper):
         try:
             await http_client.post(url='https://api.diamore.co/user/visit')
             response = await http_client.get(url='https://api.diamore.co/user')
@@ -121,7 +68,7 @@ class Tapper:
             log_error(self.log_message(f"Auth request error happened: {error}"))
             return None
 
-    async def claim_daily(self, http_client: aiohttp.ClientSession):
+    async def claim_daily(self, http_client: CloudflareScraper):
         try:
             response = await http_client.post(url='https://api.diamore.co/daily/claim')
             if response.status in [200, 201]:
@@ -131,7 +78,7 @@ class Tapper:
             log_error(self.log_message(f"Daily claim error happened: {error}"))
             return None
 
-    async def get_quests(self, http_client: aiohttp.ClientSession):
+    async def get_quests(self, http_client: CloudflareScraper):
         try:
             response = await http_client.get(url='https://api.diamore.co/quests')
             response_text = await response.text()
@@ -146,7 +93,7 @@ class Tapper:
             log_error(self.log_message(f"Get quests error happened: {error}"))
             return None
 
-    async def finish_quests(self, http_client: aiohttp.ClientSession, quest_name: str):
+    async def finish_quests(self, http_client: CloudflareScraper, quest_name: str):
         try:
             response = await http_client.post(url='https://api.diamore.co/quests/finish',
                                               json={"questName": f'{quest_name}'})
@@ -159,9 +106,9 @@ class Tapper:
             log_error(self.log_message(f"Finish quests error happened: {error}"))
             return None
 
-    async def sync_clicks(self, http_client: aiohttp.ClientSession):
+    async def sync_clicks(self, http_client: CloudflareScraper):
         try:
-            random_clicks = random.randint(settings.CLICKS[0], settings.CLICKS[1])
+            random_clicks = randint(settings.CLICKS[0], settings.CLICKS[1])
             response = await http_client.post(url='https://api.diamore.co/taps/claim',
                                               json={"amount": str(random_clicks)})
             response_text = await response.text()
@@ -174,7 +121,7 @@ class Tapper:
             log_error(self.log_message(f"Sync clicks error happened: {error}"))
             return None
 
-    async def get_ads_limit(self, http_client: aiohttp.ClientSession):
+    async def get_ads_limit(self, http_client: CloudflareScraper):
         try:
             response = await http_client.get(url='https://api.diamore.co/ads')
             resp_json = await response.json()
@@ -183,7 +130,7 @@ class Tapper:
             log_error(self.log_message(f"Get ads limit error happened: {error}"))
             return 0
 
-    async def get_upgrades(self, http_client: aiohttp.ClientSession):
+    async def get_upgrades(self, http_client: CloudflareScraper):
         try:
             response = await http_client.get(url='https://api.diamore.co/upgrades')
             resp_json = await response.json()
@@ -201,7 +148,7 @@ class Tapper:
             log_error(self.log_message(f"Get upgrades error happened: {error}"))
             return None
 
-    async def do_upgrade(self, http_client: aiohttp.ClientSession, type: str):
+    async def do_upgrade(self, http_client: CloudflareScraper, type: str):
         try:
             response = await http_client.post(url='https://api.diamore.co/upgrades/buy', json={"type": type})
             resp_json = await response.json()
@@ -213,7 +160,7 @@ class Tapper:
             log_error(self.log_message(f"Do upgrade error happened: {error}"))
             return False
 
-    async def watch_ad(self, http_client: aiohttp.ClientSession):
+    async def watch_ad(self, http_client: CloudflareScraper):
         try:
             response = await http_client.post(url='https://api.diamore.co/ads/watch', json={"type": "adsgram"})
             resp_json = await response.json()
@@ -223,7 +170,7 @@ class Tapper:
             log_error(self.log_message(f"Watch ads error happened: {error}"))
             return None
 
-    async def get_rewards(self, http_client: aiohttp.ClientSession):
+    async def get_rewards(self, http_client: CloudflareScraper):
         try:
             response = await http_client.get(url='https://api.diamore.co/daily/rewards')
             resp_json = await response.json()
@@ -262,7 +209,7 @@ class Tapper:
                     logger.info(self.log_message(f'Not enough money to upgrade {log_message}'))
                     break
 
-    async def check_proxy(self, http_client: aiohttp.ClientSession) -> bool:
+    async def check_proxy(self, http_client: CloudflareScraper) -> bool:
         proxy_conn = http_client.connector
         if proxy_conn and not hasattr(proxy_conn, '_proxy_host'):
             logger.info(self.log_message(f"Running Proxy-less"))
@@ -277,13 +224,13 @@ class Tapper:
             return False
 
     async def run(self) -> None:
-        random_delay = random.uniform(1, settings.RANDOM_DELAY_IN_RUN)
+        random_delay = uniform(1, settings.RANDOM_DELAY_IN_RUN)
         logger.info(self.log_message(f"Bot will start in <ly>{int(random_delay)}s</ly>"))
         await asyncio.sleep(random_delay)
 
         access_token_created_time = 0
         init_data = None
-        token_live_time = random.randint(3500, 3600)
+        token_live_time = randint(3500, 3600)
 
         proxy_conn = {'connector': ProxyConnector.from_url(self.proxy)} if self.proxy else {}
         async with CloudflareScraper(headers=self.headers, timeout=aiohttp.ClientTimeout(60), **proxy_conn) as http_client:
@@ -305,11 +252,14 @@ class Tapper:
                     http_client.headers['Authorization'] = f'Token {init_data}'
 
                     access_token_created_time = time()
-                    token_live_time = random.randint(3500, 3600)
+                    token_live_time = randint(3500, 3600)
 
                     user = await self.user(http_client=http_client)
                     if user is None:
                         continue
+
+                    if self.tg_client.is_fist_run:
+                        await first_run.append_recurring_session(self.session_name)
 
                     logger.info(self.log_message(f'Balance - <lc>{int(float(user["balance"]))}</lc>'))
 
@@ -394,9 +344,9 @@ class Tapper:
                                                     "game duration", "game duration")
 
                     if not next_tap_delay:
-                        sleep_time = random.randint(3500, 10800)
+                        sleep_time = randint(3500, 10800)
                     else:
-                        sleep_time = next_tap_delay.seconds * random.uniform(1, 1.1)
+                        sleep_time = next_tap_delay.seconds * uniform(1, 1.1)
 
                     logger.info(self.log_message(f'Sleep <lc>{round(sleep_time / 60, 2)}</lc> min'))
                     await asyncio.sleep(sleep_time)
@@ -409,7 +359,7 @@ class Tapper:
                     await asyncio.sleep(delay=3)
 
 
-async def run_tapper(tg_client: TelegramClient):
+async def run_tapper(tg_client: UniversalTelegramClient):
     runner = Tapper(tg_client=tg_client)
     try:
         await runner.run()

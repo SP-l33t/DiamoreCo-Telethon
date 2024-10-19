@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     API_HASH: str
     GLOBAL_CONFIG_PATH: str = "TG_FARM"
 
+    FIX_CERT: bool = False
+
     CLICKS: list[int] = [400, 1200]
 
     AUTO_UPGRADE_CLICKING_POWER: bool = False
